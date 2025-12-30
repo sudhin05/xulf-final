@@ -1,7 +1,7 @@
 [project]
 name = "kohya-ss"
 version = "34.0"
-description = "SECourses Premium Kohya SS GUI"
+description = "Looktara Xulf Kohya SS GUI V1"
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
 dependencies = [
