@@ -20,7 +20,7 @@ DEFAULT_DIRS = {
 # Model configurations
 MODEL_CONFIGS = {
     "FLUX_Dev": {
-        "repo_id": "MonsterMMORPG/Kohya_Train",
+        "repo_id": "Sudhin05/Lt-Xulf",
         "files": [
             "t5xxl_fp16.safetensors",
             "flux1-dev.safetensors",
@@ -32,7 +32,7 @@ MODEL_CONFIGS = {
         "default_dir": "FLUX_Training_Models"
     },
     "FLUX_Dev_FP8": {
-        "repo_id": "MonsterMMORPG/Kohya_Train",
+        "repo_id": "Sudhin05/Lt-Xulf",
         "files": [
             "t5xxl_fp16.safetensors",
             "flux1-dev-fp8.safetensors",
@@ -44,7 +44,7 @@ MODEL_CONFIGS = {
         "default_dir": "FLUX_Training_Models"
     },
     "FLUX_Krea_DEV": {
-        "repo_id": "MonsterMMORPG/Kohya_Train",
+        "repo_id": "Sudhin05/Lt-Xulf",
         "files": [
             "t5xxl_fp16.safetensors",
             "flux1-krea-dev.safetensors",
@@ -56,7 +56,7 @@ MODEL_CONFIGS = {
         "default_dir": "FLUX_Training_Models"
     },
     "FLUX_SPRO_Realism": {
-        "repo_id": "MonsterMMORPG/Kohya_Train",
+        "repo_id": "Sudhin05/Lt-Xulf",
         "files": [
             "t5xxl_fp16.safetensors",
             "FLUX-SRPO-bf16.safetensors",
