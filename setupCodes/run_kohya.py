@@ -37,30 +37,6 @@ def main():
     dataset_root = Path.cwd() / "kohya_dataset"
     img_parent = dataset_root / "img"
     concept_dir = img_parent / args.concept
-    concept_dir.mkdir(parents=True, exist_ok=True)
-
-    print("Inspect TRAIN_DIR (first 50 files):")
-    for i, p in enumerate(train_dir.iterdir()):
-        if i >= 50:
-            break
-        print(" ", p.name)
-
-    linked = 0
-    for p in train_dir.iterdir():
-        if p.suffix.lower() in IMG_EXTS | CAPTION_EXTS:
-            target = concept_dir / p.name
-            if not target.exists():
-                target.symlink_to(p)
-                linked += 1
-
-    print(f"Linked files: {linked}")
-
-    images = [p for p in concept_dir.iterdir() if p.suffix.lower() in IMG_EXTS]
-    if len(images) == 0:
-        print("ERROR: No images found for training.", file=sys.stderr)
-        sys.exit(2)
-
-    print(f"Total images in concept dir: {len(images)}")
 
     # 2) Corrects TOML with resolved paths from Azure
 
