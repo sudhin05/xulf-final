@@ -9,22 +9,39 @@ third step: save the preprocessed dataset as img/1_ohwx_man/img0001.png and so o
 
 """
 import zipfile
+import urllib.request
 import os
+import logging
+import argparse
 
-def unzip_dataset(url_path, extract_path):
-    """
-    Unzips the dataset from the specified URL path to the extract path.
-    """
+logging.basicConfig(filename="preprocess.log",filemode='w',level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def download_zip(url, zip_path):
+    if not os.path.exists(os.path.dirname(zip_path)):
+        os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+
+    urllib.request.urlretrieve(url, zip_path)
+    logging.info("Downloaded zip file")
+
+def unzip_dataset(zip_path, extract_path):
     if not os.path.exists(extract_path):
         os.makedirs(extract_path)
 
-    with zipfile.ZipFile(url_path, 'r') as zip_ref:
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_path)
+    logging.info("Extracted zip file")
 
 def main():
-    url_path = "https://media.looktara.com/tmp/Akanksha.zip"
-    extract_path = "Dataset/Imgs"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", type=str)
+    parser.add_argument("--zip_path", type=str, default="Dataset/dataset.zip")
+    parser.add_argument("--extract_path", type=str, default="Dataset/Imgs")
+    args = parser.parse_args()
 
-    unzip_dataset(url_path, extract_path)
-    print(f"Dataset unzipped to {extract_path}")
+    download_zip(args.url_path, args.zip_path)
+    unzip_dataset(args.zip_path,args.extract_path)
 
+
+if __name__ == "__main__":
+    main()
