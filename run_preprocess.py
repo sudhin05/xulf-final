@@ -14,7 +14,7 @@ import os
 import logging
 import argparse
 
-from setupCodes.app_no_gradio import crop_images, resize_images
+from newCodes.app_final import crop_images, resize_images
 
 logging.basicConfig(filename="preprocess.log",filemode='w',level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -62,7 +62,7 @@ def main():
         skip_no_detection=False,
         padding_value=0,
         padding_unit="percent",
-        model_dir="model"
+        model_dir=args.model_dir
     )
 
 

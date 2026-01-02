@@ -1,0 +1,987 @@
+import numpy as np
+import torch
+import cv2
+from PIL import Image
+import os
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+from tqdm import tqdm
+import time
+import platform
+import multiprocessing
+from multiprocessing import Process, Queue, Value, Lock, Manager
+import queue
+from multiprocessing import Value
+# Assuming these are available in your environment
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+from GroundingDINO.groundingdino.util.inference import load_model, load_image, predict
+from torchvision.ops import box_convert
+import tempfile
+import argparse
+import threading
+import queue
+from multiprocessing import Queue
+import os
+import threading
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='SAM Segmenter with Gradio Interface')
+    parser.add_argument('--share', action='store_true', 
+                       help='Enable Gradio live sharing (default: False)')
+    return parser.parse_args()
+
+# --- Model path resolution ---
+# IMPORTANT:
+#   This module is imported by app_no_gradio/run_preprocess.
+#   Do NOT assume a local "models" folder relative to this file.
+#   Callers must pass model_dir explicitly.
+BASE_MODEL_DIR = None
+SAM2_CHECKPOINT = None
+SAM2_MODEL_CONFIG = None
+GROUNDING_DINO_CONFIG = None
+GROUNDING_DINO_CHECKPOINT = None
+
+def resolve_model_paths(model_dir: str) -> dict:
+    base = os.path.abspath(model_dir)
+    return {
+        "BASE_MODEL_DIR": base,
+        "SAM2_CHECKPOINT": os.path.join(base, "sam2.1_hiera_large.pt"),
+        "SAM2_MODEL_CONFIG": os.path.join(base, "sam2.1_hiera_l.yaml"),
+        "GROUNDING_DINO_CONFIG": os.path.join(base, "GroundingDINO_SwinT_OGC.py"),
+        "GROUNDING_DINO_CHECKPOINT": os.path.join(base, "groundingdino_swint_ogc.pth"),
+    }
+
+def validate_model_paths(paths: dict) -> None:
+    missing_keys = []
+    for k in ("SAM2_CHECKPOINT", "SAM2_MODEL_CONFIG", "GROUNDING_DINO_CONFIG", "GROUNDING_DINO_CHECKPOINT"):
+        v = paths.get(k)
+        if not v or not os.path.exists(v):
+            missing_keys.append(k)
+    if missing_keys:
+        details = "\n".join([f" - {k}: {paths.get(k)}" for k in missing_keys])
+        raise FileNotFoundError(
+            f"Missing required SAM2/GDINO files under model_dir='{paths.get('BASE_MODEL_DIR')}'.\n{details}"
+        )
+
+def set_model_dir(model_dir: str) -> dict:
+    """Optional helper for CLI usage; sets module-level path variables."""
+    global BASE_MODEL_DIR, SAM2_CHECKPOINT, SAM2_MODEL_CONFIG, GROUNDING_DINO_CONFIG, GROUNDING_DINO_CHECKPOINT
+    paths = resolve_model_paths(model_dir)
+    validate_model_paths(paths)
+    BASE_MODEL_DIR = paths["BASE_MODEL_DIR"]
+    SAM2_CHECKPOINT = paths["SAM2_CHECKPOINT"]
+    SAM2_MODEL_CONFIG = paths["SAM2_MODEL_CONFIG"]
+    GROUNDING_DINO_CONFIG = paths["GROUNDING_DINO_CONFIG"]
+    GROUNDING_DINO_CHECKPOINT = paths["GROUNDING_DINO_CHECKPOINT"]
+    return paths
+
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+OUTPUT_DIR = "outputs"
+MASKS_DIR = "generated_masks"
+
+# Add new constant for negative masks directory
+NEGATIVE_MASKS_DIR = "generated_negative_masks"
+
+# --- Make input_folder truly global ---
+input_folder = ""  # Initialize globally
+
+# --- Synchronization ---
+debug = True
+stop_processing = Value('b', False)  # Initialize as a multiprocessing Value
+worker_timings = {}
+
+def scan_existing_masks(input_folder: str, output_masks_folder: str) -> tuple[list, list]:
+    """
+    Scan input and output folders to identify which files can be skipped.
+    """
+    input_files = [
+        f for f in os.listdir(input_folder)
+        if os.path.isfile(os.path.join(input_folder, f)) and
+        f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'))
+    ]
+    
+    files_to_skip = []
+    files_to_process = []
+    
+    for input_file in input_files:
+        base_name = os.path.splitext(input_file)[0]
+        mask_path = os.path.join(output_masks_folder, f"mask_{base_name}.png")
+        
+        if os.path.exists(mask_path):
+            files_to_skip.append(input_file)
+        else:
+            # Add full path to files_to_process
+            files_to_process.append(os.path.join(input_folder, input_file))
+            
+    return files_to_process, files_to_skip
+
+def open_folder():
+    open_folder_path = os.path.abspath("outputs")
+    if platform.system() == "Windows":
+        os.startfile(open_folder_path)
+    elif platform.system() == "Linux":
+        os.system(f'xdg-open "{open_folder_path}"')
+
+def open_folder_mask():
+    open_folder_path = os.path.abspath("generated_masks")
+    if platform.system() == "Windows":
+        os.startfile(open_folder_path)
+    elif platform.system() == "Linux":
+        os.system(f'xdg-open "{open_folder_path}"')
+
+def open_folder_negative_mask():
+    open_folder_path = os.path.abspath("generated_negative_masks")
+    if platform.system() == "Windows":
+        os.startfile(open_folder_path)
+    elif platform.system() == "Linux":
+        os.system(f'xdg-open "{open_folder_path}"')
+
+# --- Model Loading ---
+# NOTE: Do not validate or load model files at import time.
+# This module is used as a library by app_no_gradio/run_preprocess; those callers pass model_dir.
+# When running this file directly (CLI), main() accepts --model-dir.
+# --- Data Classes ---
+
+
+@dataclass
+class BoundingBox:
+    xmin: int
+    ymin: int
+    ymax: int
+    xmax: int
+
+    @property
+    def xyxy(self) -> List[float]:
+        return [self.xmin, self.ymin, self.xmax, self.ymax]
+
+@dataclass
+class DetectionResult:
+    score: float
+    label: str
+    box: BoundingBox
+    mask: Optional[np.array] = None
+
+# --- Helper Functions ---
+
+def mask_to_polygon(mask: np.ndarray) -> List[List[int]]:
+    mask = (mask > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    largest_contour = max(contours, key=cv2.contourArea)
+    epsilon = 0.001 * cv2.arcLength(largest_contour, True)
+    approx_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+    return approx_contour.reshape(-1, 2).tolist()
+
+def polygon_to_mask(polygon: List, image_shape: tuple) -> np.ndarray:
+    if not polygon:
+        return np.zeros(image_shape, dtype=np.uint8)
+    mask = np.zeros(image_shape, dtype=np.uint8)
+    pts = np.array(polygon, dtype=np.int32)
+    cv2.fillPoly(mask, [pts], color=(1,))
+    return mask
+
+def get_boxes_from_gdino(results: tuple) -> List[List[float]]:
+    boxes = []
+    for box in results[0]:
+        xyxy = box.tolist()
+        boxes.append(xyxy)
+    return boxes
+    
+def refine_masks(masks: np.ndarray, image_shape: tuple) -> List[np.ndarray]:
+    refined_masks = []
+    for mask in masks:
+        # Ensure the mask is a boolean array
+        mask_bool = mask > 0
+
+        # Resize the mask to the original image shape
+        mask_resized = cv2.resize(mask_bool.astype(np.uint8) * 255, (image_shape[1], image_shape[0]))
+
+        # Threshold the resized mask to ensure binary values (0 or 255)
+        _, mask_thresholded = cv2.threshold(mask_resized, 127, 255, cv2.THRESH_BINARY)
+
+        # Convert the mask back to boolean array (True/False)
+        mask_bool = mask_thresholded > 0
+        
+        refined_masks.append(mask_bool)
+
+    return refined_masks
+
+# --- Main Processing Functions ---
+def detect(
+    temp_image_path: str,
+    labels: List[str],
+    box_threshold: float = 0.3,
+    text_threshold: float = 0.25,
+    local_grounding_model = None
+) -> List[DetectionResult]:
+    image_source, image = load_image(temp_image_path)
+    h, w, _ = image_source.shape
+    
+    text_prompt = ". ".join(labels) + "."
+    
+    with torch.amp.autocast(device_type='cuda', dtype=torch.float16): # Use updated autocast
+        boxes, confidences, phrases = predict(
+            model= local_grounding_model if local_grounding_model else grounding_model,
+            image=image,
+            caption=text_prompt,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+        )
+    
+    # Scale boxes by image dimensions
+    boxes = boxes * torch.Tensor([w, h, w, h])
+    boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+    
+    detections = []
+    for box, score, label in zip(boxes, confidences, phrases):
+        detections.append(
+            DetectionResult(
+                score=score,
+                label=label,
+                box=BoundingBox(
+                    xmin=int(box[0]),
+                    ymin=int(box[1]),
+                    xmax=int(box[2]),
+                    ymax=int(box[3])
+                )
+            )
+        )
+    return detections
+
+def segment(
+    temp_image_path: str,
+    detection_results: List[DetectionResult],
+    local_sam2_predictor = None
+) -> List[DetectionResult]:
+    image_source, _ = load_image(temp_image_path)
+    local_sam2_predictor.set_image(image_source)
+
+    # Get boxes in correct format
+    boxes = np.array([det.box.xyxy for det in detection_results])
+    
+    # Use SAM2 predictor
+    masks, _, _ = local_sam2_predictor.predict(
+        point_coords=None,
+        point_labels=None,
+        box=boxes,
+        multimask_output=False,
+    )
+    
+    # Handle mask dimensionality
+    if masks.ndim == 4:
+        masks = masks.squeeze(1)
+    
+    # Assign masks to detection results
+    for detection_result, mask in zip(detection_results, masks):
+        detection_result.mask = mask > 0  # Convert to boolean mask
+        
+    return detection_results
+    
+def check_exif_orientation(image):
+    """Check if image has EXIF orientation that needs correction."""
+    try:
+        if hasattr(image, '_getexif'):  # Check if image has EXIF data
+            exif = image._getexif()
+            if exif is not None:
+                orientation = exif.get(274)  # 274 is the orientation tag
+                # Return True only if orientation exists and is not 1 (normal)
+                return orientation is not None and orientation != 1, orientation
+    except Exception as e:
+        print(f"Error checking EXIF orientation: {e}")
+    return False, None
+
+def apply_exif_orientation(image, orientation):
+    """Apply the rotation and flip specified in the EXIF orientation tag."""
+    try:
+        # Create new image with correct dimensions first
+        if orientation in [5, 6, 7, 8]:
+            # Swap dimensions for 90/270 degree rotations
+            new_width = image.height
+            new_height = image.width
+            image = image.resize((new_width, new_height))
+
+        ORIENTATION_CONFIGS = {
+            2: lambda x: x.transpose(Image.FLIP_LEFT_RIGHT),    # Mirror horizontal
+            3: lambda x: x.rotate(180, expand=True),            # Rotate 180
+            4: lambda x: x.transpose(Image.FLIP_TOP_BOTTOM),    # Mirror vertical
+            5: lambda x: x.transpose(Image.FLIP_LEFT_RIGHT).rotate(90, expand=True),  # Mirror horizontal and rotate 270
+            6: lambda x: x.rotate(-90, expand=True),            # Rotate 90
+            7: lambda x: x.transpose(Image.FLIP_LEFT_RIGHT).rotate(-90, expand=True), # Mirror horizontal and rotate 90
+            8: lambda x: x.rotate(90, expand=True),             # Rotate 270
+        }
+        if orientation in ORIENTATION_CONFIGS:
+            return ORIENTATION_CONFIGS[orientation](image)
+    except Exception as e:
+        print(f"Error applying EXIF orientation: {e}")
+    return image
+
+def save_image_without_exif(img, save_path):
+    """Save image with EXIF orientation already applied (like Paint.NET)."""
+    try:
+        if hasattr(img, '_getexif'):  # Check if image has EXIF data
+            exif = img._getexif()
+            if exif is not None and 274 in exif:  # 274 is orientation tag
+                orientation = exif[274]
+                if orientation != 1:
+                    ORIENTATION_CONFIGS = {
+                        2: lambda x: x.transpose(Image.FLIP_LEFT_RIGHT),
+                        3: lambda x: x.rotate(180, expand=True),
+                        4: lambda x: x.transpose(Image.FLIP_TOP_BOTTOM),
+                        5: lambda x: x.transpose(Image.FLIP_LEFT_RIGHT).rotate(90, expand=True),
+                        6: lambda x: x.rotate(-90, expand=True),
+                        7: lambda x: x.transpose(Image.FLIP_LEFT_RIGHT).rotate(-90, expand=True),
+                        8: lambda x: x.rotate(90, expand=True),
+                    }
+                    if orientation in ORIENTATION_CONFIGS:
+                        img = ORIENTATION_CONFIGS[orientation](img)
+    except Exception as e:
+        print(f"Error handling EXIF: {e}")
+    
+    # Save without EXIF data
+    img.convert("RGB").save(save_path, format='PNG')
+
+def process_image(input_image, text_prompt, box_threshold, text_threshold, save_mask, local_sam2_predictor, local_grounding_model, output_dir, masks_dir, processed_files_queue, processed_count, lock, image_path=None, negative_prompt=None, negative_masks_dir=None):
+    global input_folder
+    temp_image_path = None
+
+    try:
+        timestamp = int(time.time() * 1000000)
+        pid = multiprocessing.current_process().pid
+
+        # Create temp_fix_image directory in system's temp directory
+        temp_fix_dir = os.path.join(tempfile.gettempdir(), "temp_fix_image")
+        os.makedirs(temp_fix_dir, exist_ok=True)
+
+        # Create temp directory only if output_dir is not None
+        temp_images_dir = os.path.join(output_dir, "temp_images") if output_dir else None
+
+        if processed_files_queue is not None:
+            # Batch mode: Use image_path
+            img = Image.open(image_path)
+            # Create temp file only if image has EXIF data
+            if hasattr(img, '_getexif') and img._getexif() is not None:
+                temp_filename = f"temp_stripped_{timestamp}_{pid}.png"
+                if temp_images_dir:
+                    os.makedirs(temp_images_dir, exist_ok=True)
+                    temp_image_path = os.path.join(temp_images_dir, temp_filename)
+                else:
+                    temp_image_path = os.path.join(temp_fix_dir, temp_filename)
+                save_image_without_exif(img, temp_image_path)
+                input_image = Image.open(temp_image_path)
+            else:
+                temp_image_path = image_path
+                input_image = img.convert("RGB")
+        else:
+            # Single image mode
+            if isinstance(input_image, np.ndarray):
+                input_image = Image.fromarray(input_image)
+            
+            temp_filename = f"temp_{timestamp}_{pid}.png"
+            if temp_images_dir:
+                os.makedirs(temp_images_dir, exist_ok=True)
+                temp_image_path = os.path.join(temp_images_dir, temp_filename)
+            else:
+                temp_image_path = os.path.join(temp_fix_dir, temp_filename)
+            save_image_without_exif(input_image, temp_image_path)
+
+        # Detect and segment using temp_image_path
+        labels = [text_prompt]
+        detections = detect(temp_image_path, labels, box_threshold, text_threshold, local_grounding_model=local_grounding_model)
+
+        if not detections:
+            print(f"No detections found for image with prompt '{text_prompt}'")
+            if temp_image_path != image_path and temp_image_path and os.path.exists(temp_image_path):
+                os.remove(temp_image_path)
+            return np.array(input_image), None, [], temp_image_path, None
+
+        detections = segment(temp_image_path, detections, local_sam2_predictor=local_sam2_predictor)
+
+        # Create visualization
+        segmented_image = annotate(input_image, detections)
+
+        # Save the segmented image with a unique name only if output_dir exists
+        if processed_files_queue is None and output_dir:
+            output_image_filename = f"output_{timestamp}_{text_prompt.replace(' ', '_')}_{box_threshold:.2f}_{pid}.png"
+            output_image_path = os.path.join(output_dir, output_image_filename)
+            Image.fromarray(segmented_image).save(output_image_path)
+
+        # Handle mask generation and coordinates
+        mask_image = None
+        mask_coordinates = []
+        negative_mask_image = None
+
+        if save_mask and detections:
+            combined_mask = np.zeros(np.array(input_image).shape[:2], dtype=np.uint8)
+            for detection in detections:
+                if detection.mask is not None:
+                    combined_mask |= detection.mask.astype(np.uint8)
+            
+            # Process negative prompt if provided
+            if negative_prompt and negative_prompt.strip():
+                negative_labels = [negative_prompt]
+                negative_detections = detect(temp_image_path, negative_labels, box_threshold, text_threshold, local_grounding_model=local_grounding_model)
+                
+                if negative_detections:
+                    negative_detections = segment(temp_image_path, negative_detections, local_sam2_predictor=local_sam2_predictor)
+                    
+                    # Create negative mask
+                    negative_mask = np.zeros(np.array(input_image).shape[:2], dtype=np.uint8)
+                    for detection in negative_detections:
+                        if detection.mask is not None:
+                            negative_mask |= detection.mask.astype(np.uint8)
+                    
+                    # Save negative mask separately
+                    negative_mask_image = Image.fromarray(negative_mask * 255)
+                    
+                    # Save negative mask if directory exists
+                    if processed_files_queue is None and negative_masks_dir:
+                        os.makedirs(negative_masks_dir, exist_ok=True)
+                        negative_mask_filename = f"negative_mask_{timestamp}_{negative_prompt.replace(' ', '_')}_{box_threshold:.2f}_{pid}.png"
+                        negative_mask_image.save(os.path.join(negative_masks_dir, negative_mask_filename))
+                    
+                    # Debug info
+                    print(f"Positive mask pixels: {np.sum(combined_mask)}")
+                    print(f"Negative mask pixels: {np.sum(negative_mask)}")
+                    
+                    # Ensure masks are binary (0 or 1) with proper type casting
+                    combined_mask_bin = (combined_mask > 0).astype(np.uint8)
+                    negative_mask_bin = (negative_mask > 0).astype(np.uint8)
+                    
+                    # Subtract negative mask from combined mask using binary operations
+                    # This ensures areas in the negative mask are removed from the positive mask
+                    combined_mask = combined_mask_bin & ~negative_mask_bin
+                    
+                    # Alternative mathematical approach (commented out for reference)
+                    # combined_mask = np.clip(combined_mask_bin - negative_mask_bin, 0, 1)
+                    
+                    print(f"Final mask pixels after subtraction: {np.sum(combined_mask)}")
+
+            mask_image = Image.fromarray(combined_mask * 255)
+            mask_coords = np.where(combined_mask > 0)
+            mask_coordinates = list(zip(mask_coords[0].tolist(), mask_coords[1].tolist()))
+
+            # Save mask only if masks_dir exists
+            if processed_files_queue is None and masks_dir:
+                os.makedirs(masks_dir, exist_ok=True)
+                mask_filename = f"mask_{timestamp}_{text_prompt.replace(' ', '_')}_{box_threshold:.2f}_{pid}.png"
+                mask_image.save(os.path.join(masks_dir, mask_filename))
+
+        # Cleanup temporary file only if we created it
+        if temp_image_path != image_path and temp_image_path and os.path.exists(temp_image_path):
+            os.remove(temp_image_path)
+
+        return segmented_image, mask_image, mask_coordinates, temp_image_path, negative_mask_image
+
+    except Exception as e:
+        print(f"Error processing image: {e}")
+        if temp_image_path and temp_image_path != image_path and os.path.exists(temp_image_path):
+            os.remove(temp_image_path)
+        return np.array(input_image), None, [], temp_image_path, None
+
+def annotate(image: Image.Image, detection_results: List[DetectionResult]) -> np.ndarray:
+    image_cv2 = np.array(image)
+    image_cv2 = cv2.cvtColor(image_cv2, cv2.COLOR_RGB2BGR)
+
+    for detection in detection_results:
+        label = detection.label
+        score = detection.score
+        box = detection.box
+        mask = detection.mask
+
+        color = np.random.randint(0, 256, size=3)
+
+        if mask is not None:
+            overlay = image_cv2.copy()
+            mask_display = (mask * 255).astype(np.uint8)
+            overlay[mask == 1] = color
+            image_cv2 = cv2.addWeighted(image_cv2, 0.7, overlay, 0.3, 0)
+
+            contours, _ = cv2.findContours(mask_display, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(image_cv2, contours, -1, color.tolist(), 2)
+
+        cv2.rectangle(image_cv2, (box.xmin, box.ymin), (box.xmax, box.ymax), color.tolist(), 2)
+        cv2.putText(
+            image_cv2,
+            f'{label}: {score:.2f}',
+            (box.xmin, box.ymin - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color.tolist(),
+            2
+        )
+
+    return cv2.cvtColor(image_cv2, cv2.COLOR_BGR2RGB)
+
+def distribute_tasks(image_files, gpu_ids, batch_size):
+    num_gpus = len(gpu_ids)
+    num_workers_per_gpu = batch_size
+    total_workers = num_gpus * num_workers_per_gpu
+
+    # Distribute tasks evenly among all workers
+    tasks_per_worker = [[] for _ in range(total_workers)]
+    for i, image_file in enumerate(image_files):
+        worker_index = i % total_workers
+        tasks_per_worker[worker_index].append(image_file)
+
+    # Group tasks by GPU
+    tasks_per_gpu = [tasks_per_worker[i:i+num_workers_per_gpu] for i in range(0, total_workers, num_workers_per_gpu)]
+
+    return tasks_per_gpu
+def worker_process(
+    gpu_id: int,
+    worker_id: int,
+    tasks: List[str],
+    output_segmented_folder: str,
+    output_masks_folder: str,
+    text_prompt: str,
+    box_threshold: float,
+    text_threshold: float,
+    results_queue: Queue,
+    processed_files_queue: Queue,
+    processed_count: Value,
+    stop_processing: Value,
+    status_queue: Queue,
+    big_lock: Lock,
+    negative_prompt: str = None,
+    negative_masks_folder: str = None,
+    model_dir: str = "models",
+):
+    try:
+        device = f"cuda:{gpu_id}"
+        status_queue.put(f"INFO:Worker {worker_id} starting on GPU {gpu_id}")
+        print(f"Worker {worker_id} on GPU {gpu_id} starting on device {device}")
+
+        # Load models
+        try:
+            paths = resolve_model_paths(model_dir)
+            validate_model_paths(paths)
+
+            local_sam2_model = build_sam2(paths["SAM2_MODEL_CONFIG"], paths["SAM2_CHECKPOINT"], device=device)
+            local_sam2_predictor = SAM2ImagePredictor(local_sam2_model)
+            local_grounding_model = load_model(
+                model_config_path=paths["GROUNDING_DINO_CONFIG"],
+                model_checkpoint_path=paths["GROUNDING_DINO_CHECKPOINT"],
+                device=device
+            )
+            status_queue.put(f"INFO:Models loaded successfully on GPU {gpu_id}")
+        except Exception as e:
+            error_msg = f"Failed to load models on GPU {gpu_id}: {str(e)}"
+            status_queue.put(f"ERROR:{error_msg}")
+            results_queue.put(error_msg)
+            return
+
+        total_tasks = len(tasks)
+        start_time = time.time()
+
+        for task_idx, image_path in enumerate(tasks, 1):
+            if stop_processing.value:
+                status_queue.put(f"STOPPED:Worker {worker_id} on GPU {gpu_id}")
+                print(f"Worker {worker_id} on GPU {gpu_id} stopping due to user request")
+                return
+
+            try:
+                base_name = os.path.splitext(os.path.basename(image_path))[0]
+                segmented_image_path = os.path.join(output_segmented_folder, f"segmented_{base_name}.png")
+                mask_image_path = os.path.join(output_masks_folder, f"mask_{base_name}.png")
+                negative_mask_image_path = os.path.join(negative_masks_folder, f"negative_mask_{base_name}.png") if negative_masks_folder and negative_prompt else None
+
+                # Check if input image exists
+                if not os.path.exists(image_path):
+                    error_msg = f"Image not found: {image_path}"
+                    status_queue.put(f"ERROR:{error_msg}")
+                    results_queue.put(error_msg)
+                    continue
+
+                # Process image
+                try:
+                    input_image = Image.open(image_path).convert("RGB")
+                except Exception as e:
+                    error_msg = f"Failed to open image {base_name}: {str(e)}"
+                    status_queue.put(f"ERROR:{error_msg}")
+                    results_queue.put(error_msg)
+                    continue
+
+                try:
+                    segmented_image, mask_image, _, _, negative_mask_image = process_image(
+                        np.array(input_image),
+                        text_prompt,
+                        box_threshold,
+                        text_threshold,
+                        save_mask=True,
+                        local_sam2_predictor=local_sam2_predictor,
+                        local_grounding_model=local_grounding_model,
+                        output_dir=output_segmented_folder,
+                        masks_dir=output_masks_folder,
+                        processed_files_queue=processed_files_queue,
+                        processed_count=processed_count,
+                        lock=big_lock,
+                        image_path=image_path,
+                        negative_prompt=negative_prompt,
+                        negative_masks_dir=negative_masks_folder
+                    )
+
+                    # Save outputs
+                    Image.fromarray(segmented_image).save(segmented_image_path)
+                    if mask_image:
+                        mask_image.save(mask_image_path)
+                    if negative_mask_image and negative_masks_folder:
+                        negative_mask_image.save(negative_mask_image_path)
+
+                    # Update progress
+                    with big_lock:
+                        processed_count.value += 1
+                    
+                    # Calculate progress statistics
+                    elapsed_time = time.time() - start_time
+                    images_per_second = task_idx / elapsed_time if elapsed_time > 0 else 0
+                    remaining_tasks = total_tasks - task_idx
+                    eta = remaining_tasks / images_per_second if images_per_second > 0 else 0
+
+                    status_msg = (
+                        f"PROGRESS:"
+                        f"Worker {worker_id} | "
+                        f"Processed: {task_idx}/{total_tasks} | "
+                        f"Speed: {images_per_second:.2f} img/s | "
+                        f"ETA: {eta:.1f}s | "
+                        f"Current: {base_name}"
+                    )
+                    status_queue.put(status_msg)
+                    processed_files_queue.put(segmented_image_path)
+                    results_queue.put(f"Successfully processed {base_name}")
+
+                except Exception as e:
+                    error_msg = f"Failed to process {base_name}: {str(e)}"
+                    status_queue.put(f"ERROR:{error_msg}")
+                    results_queue.put(error_msg)
+                    continue
+
+            except Exception as e:
+                error_msg = f"Unexpected error processing {image_path}: {str(e)}"
+                status_queue.put(f"ERROR:{error_msg}")
+                results_queue.put(error_msg)
+                continue
+
+        # Final status update
+        completion_msg = f"COMPLETED:Worker {worker_id} finished processing {len(tasks)} images"
+        status_queue.put(completion_msg)
+        print(completion_msg)
+
+    except Exception as e:
+        error_msg = f"Critical error in worker {worker_id} on GPU {gpu_id}: {str(e)}"
+        status_queue.put(f"ERROR:{error_msg}")
+        results_queue.put(error_msg)
+        raise
+
+    finally:
+        # Cleanup
+        try:
+            del local_sam2_model
+            del local_sam2_predictor
+            del local_grounding_model
+            torch.cuda.empty_cache()
+            status_queue.put(f"INFO:Worker {worker_id} cleaned up successfully")
+        except Exception as e:
+            status_queue.put(f"ERROR:Cleanup failed for worker {worker_id}: {str(e)}")
+
+def batch_process_images(
+    input_folder_local,
+    output_segmented_folder,
+    output_masks_folder,
+    text_prompt,
+    box_threshold,
+    text_threshold,
+    batch_size,
+    gpu_ids,
+    status_queue,
+    skip_existing=False,
+    negative_prompt=None,
+    model_dir: str = "models",
+):
+    global input_folder, stop_processing
+    input_folder = input_folder_local
+    
+    # Create negative masks folder
+    negative_masks_folder = os.path.join(os.path.dirname(output_masks_folder), NEGATIVE_MASKS_DIR)
+
+    try:
+        # Create output directories
+        os.makedirs(output_segmented_folder, exist_ok=True)
+        os.makedirs(output_masks_folder, exist_ok=True)
+        if negative_prompt and negative_prompt.strip():
+            os.makedirs(negative_masks_folder, exist_ok=True)
+        else:
+            negative_masks_folder = None
+
+        # Scan for existing masks if skip_existing is enabled
+        if skip_existing:
+            image_files_to_process, skipped_files = scan_existing_masks(
+                input_folder, output_masks_folder
+            )
+            if skipped_files:
+                status_queue.put(
+                    f"INFO:Skipping {len(skipped_files)} existing files: {', '.join(skipped_files)}"
+                )
+                print(f"Skipping {len(skipped_files)} files with existing masks")
+        else:
+            image_files_to_process = [
+                os.path.join(input_folder, f)
+                for f in os.listdir(input_folder)
+                if os.path.isfile(os.path.join(input_folder, f))
+                and f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'))
+            ]
+
+        total_tasks = len(image_files_to_process)
+
+        if total_tasks == 0:
+            status_msg = "No new images to process" if skip_existing else "No images found in input folder"
+            status_queue.put(f"ERROR:{status_msg}")
+            return status_msg
+
+        status_queue.put(f"INFO:Found {total_tasks} images to process")
+        print(f"Found {total_tasks} images to process")
+
+        # Fix: Use image_files_to_process instead of image_files
+        tasks_per_gpu = distribute_tasks(image_files_to_process, gpu_ids, batch_size)
+
+        # Create a new Manager for each batch processing run
+        manager = Manager()
+        processes = []
+        
+        try:
+            # Create shared objects using the manager
+            results_queue = manager.Queue()
+            processed_files_queue = manager.Queue()
+            processed_count = manager.Value('i', 0)
+            stop_processing = manager.Value('b', False)
+            big_lock = manager.Lock()
+
+            # Start worker processes
+            for gpu_index, gpu_id in enumerate(gpu_ids):
+                for worker_index, tasks in enumerate(tasks_per_gpu[gpu_index]):
+                    if not tasks:  # Skip if no tasks for this worker
+                        continue
+                    worker_id = gpu_index * batch_size + worker_index
+                    p = Process(
+                        target=worker_process,
+                        args=(
+                            gpu_id,
+                            worker_id,
+                            tasks,
+                            output_segmented_folder,
+                            output_masks_folder,
+                            text_prompt,
+                            box_threshold,
+                            text_threshold,
+                            results_queue,
+                            processed_files_queue,
+                            processed_count,
+                            stop_processing,
+                            status_queue,
+                            big_lock,
+                            negative_prompt,
+                            negative_masks_folder,
+                            model_dir
+                        )
+                    )
+                    p.start()
+                    processes.append(p)
+                    
+            # Monitor progress and calculate statistics
+            start_time = time.time()
+            while processed_count.value < total_tasks and any(p.is_alive() for p in processes):
+                if stop_processing.value:
+                    status_queue.put("STOPPED:Processing stopped by user")
+                    break
+                    
+                try:
+                    result = results_queue.get(timeout=1)
+                    print(result)
+
+                    # Calculate and display statistics
+                    elapsed_time = time.time() - start_time
+                    current_processed_count = processed_count.value
+                    processing_rate = current_processed_count / elapsed_time if elapsed_time > 0 else 0
+                    remaining_tasks = total_tasks - current_processed_count
+                    estimated_time_remaining = remaining_tasks / processing_rate if processing_rate > 0 else 0
+                    
+                    status_message = (
+                        f"PROGRESS:Processed: {current_processed_count}/{total_tasks} | "
+                        f"Speed: {processing_rate:.2f} images/s | "
+                        f"ETA: {estimated_time_remaining:.2f} s | "
+                        f"Active workers: {sum(1 for p in processes if p.is_alive())}"
+                    )
+                    status_queue.put(status_message)
+                    print(status_message)
+
+                except queue.Empty:
+                    continue
+
+            return_message = "Processing stopped by user." if stop_processing.value else f"Completed processing {processed_count.value} out of {total_tasks} images"
+            status_queue.put(f"{'STOPPED:' if stop_processing.value else 'COMPLETED:'}{return_message}")
+            return return_message
+
+        finally:
+            # Clean up processes
+            stop_processing.value = True
+            for p in processes:
+                p.terminate()
+                p.join(timeout=1)
+            
+            # Clean up manager
+            #manager.shutdown()
+
+    except Exception as e:
+        error_message = f"Batch processing failed: {str(e)}"
+        status_queue.put(f"ERROR:{error_message}")
+        return error_message
+
+# Update the Gradio interface to handle the new return value
+
+
+def _cli_print_status_queue(status_queue):
+    """Best-effort printer for status messages coming from batch_process_images."""
+    try:
+        while True:
+            msg = status_queue.get(timeout=0.5)
+            print(msg, flush=True)
+            if isinstance(msg, str) and (msg.startswith("COMPLETED:") or msg.startswith("STOPPED:") or msg.startswith("ERROR:")):
+                # final-ish messages; still may be more but usually this ends
+                # Don't break immediately on ERROR because other processes might still flush; but OK.
+                pass
+    except Exception:
+        return
+
+def main():
+    """
+    CLI entrypoint (Gradio removed).
+
+    Examples:
+      python SAM_Segmenter.py batch --input /data/in --segmented /data/out/seg --masks /data/out/masks --prompt "face."
+      python SAM_Segmenter.py single --image /path/img.png --prompt "face." --out /data/out
+    """
+    parser = argparse.ArgumentParser(description="SAM2 + GroundingDINO segmentation (CLI, Gradio removed)")
+    parser.add_argument("--model-dir", default="models", help="Directory containing SAM2/GroundingDINO weights & configs")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_batch = sub.add_parser("batch", help="Batch process a folder")
+    p_batch.add_argument("--input", required=True, help="Input folder of images")
+    p_batch.add_argument("--segmented", required=True, help="Output folder for segmented images")
+    p_batch.add_argument("--masks", required=True, help="Output folder for masks")
+    p_batch.add_argument("--prompt", required=True, help="Text prompt, e.g. 'face.' or 'eye. lips.'")
+    p_batch.add_argument("--negative-prompt", default="", help="Negative prompt, e.g. 'hair.' (optional)")
+    p_batch.add_argument("--box-threshold", type=float, default=0.35)
+    p_batch.add_argument("--text-threshold", type=float, default=0.25)
+    p_batch.add_argument("--batch-size", type=int, default=2)
+    p_batch.add_argument("--gpu-ids", default="0", help="Comma-separated GPU ids, e.g. 0 or 0,1")
+    p_batch.add_argument("--skip-existing", action="store_true", help="Skip images where mask already exists")
+
+    p_single = sub.add_parser("single", help="Process a single image")
+    p_single.add_argument("--image", required=True, help="Path to an image")
+    p_single.add_argument("--out", required=True, help="Output directory root")
+    p_single.add_argument("--masks", default="", help="Masks directory (default: <out>/generated_masks)")
+    p_single.add_argument("--prompt", required=True)
+    p_single.add_argument("--negative-prompt", default="")
+    p_single.add_argument("--box-threshold", type=float, default=0.35)
+    p_single.add_argument("--text-threshold", type=float, default=0.25)
+
+    args = parser.parse_args()
+
+    if args.cmd == "batch":
+        # Use a multiprocessing queue so child processes can publish status messages
+        status_queue = Queue()
+        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",") if x.strip() != ""]
+        # Run in background thread so we can print status_queue updates while processing
+        t = threading.Thread(
+            target=batch_process_images,
+            args=(
+                args.input,
+                args.segmented,
+                args.masks,
+                args.prompt,
+                args.box_threshold,
+                args.text_threshold,
+                args.batch_size,
+                gpu_ids,
+                status_queue,
+                args.skip_existing,
+                (args.negative_prompt if args.negative_prompt.strip() else None),
+                args.model_dir,
+            ),
+            daemon=True,
+        )
+        t.start()
+
+        # Print queue output until thread ends
+        while t.is_alive():
+            try:
+                msg = status_queue.get(timeout=1)
+                print(msg, flush=True)
+            except queue.Empty:
+                continue
+        # Drain any remaining messages briefly
+        try:
+            while True:
+                msg = status_queue.get_nowait()
+                print(msg, flush=True)
+        except Exception:
+            pass
+        t.join()
+        return
+
+    if args.cmd == "single":
+        os.makedirs(args.out, exist_ok=True)
+        masks_dir = args.masks if args.masks else os.path.join(args.out, MASKS_DIR)
+        os.makedirs(masks_dir, exist_ok=True)
+
+        device = DEVICE
+        paths = resolve_model_paths(args.model_dir)
+        validate_model_paths(paths)
+        local_sam2_model = build_sam2(paths["SAM2_MODEL_CONFIG"], paths["SAM2_CHECKPOINT"], device=device)
+        local_sam2_predictor = SAM2ImagePredictor(local_sam2_model)
+        local_grounding_model = load_model(
+            model_config_path=paths["GROUNDING_DINO_CONFIG"],
+            model_checkpoint_path=paths["GROUNDING_DINO_CHECKPOINT"],
+            device=device
+        )
+
+        img = Image.open(args.image).convert("RGB")
+        segmented_image, mask_image, _, _, negative_mask_image = process_image(
+            np.array(img),
+            args.prompt,
+            args.box_threshold,
+            args.text_threshold,
+            save_mask=True,
+            local_sam2_predictor=local_sam2_predictor,
+            local_grounding_model=local_grounding_model,
+            output_dir=args.out,
+            masks_dir=masks_dir,
+            processed_files_queue=None,
+            processed_count=None,
+            lock=None,
+            image_path=args.image,
+            negative_prompt=(args.negative_prompt if args.negative_prompt.strip() else None),
+            negative_masks_dir=(NEGATIVE_MASKS_DIR if args.negative_prompt.strip() else None),
+        )
+
+        base = os.path.splitext(os.path.basename(args.image))[0]
+        seg_path = os.path.join(args.out, f"segmented_{base}.png")
+        mask_path = os.path.join(masks_dir, f"mask_{base}.png")
+        Image.fromarray(segmented_image).save(seg_path)
+        if mask_image is not None:
+            Image.fromarray(mask_image).save(mask_path)
+        if negative_mask_image is not None:
+            neg_dir = os.path.join(args.out, NEGATIVE_MASKS_DIR)
+            os.makedirs(neg_dir, exist_ok=True)
+            neg_path = os.path.join(neg_dir, f"negative_mask_{base}.png")
+            Image.fromarray(negative_mask_image).save(neg_path)
+
+        print(f"Saved: {seg_path}")
+        print(f"Saved: {mask_path}" if mask_image is not None else "No mask produced")
+        return
+
+
+if __name__ == "__main__":
+    main()

@@ -107,16 +107,52 @@ debug = False
 
 import os
 
-# Import SAM2 functions and constants
-from .SAM_Segmenter_no_gradio import (
-    build_sam2, BASE_MODEL_DIR, GROUNDING_DINO_CONFIG, GROUNDING_DINO_CHECKPOINT, SAM2_CHECKPOINT, SAM2_MODEL_CONFIG, SAM2ImagePredictor, load_model,
-    process_image as sam2_process_image
+# Import SAM2 functions (NO path assumptions here)
+from .SAM_Segmenter_final import (
+    build_sam2,
+    SAM2ImagePredictor,
+    load_model,
+    process_image as sam2_process_image,
+    resolve_model_paths as resolve_sam2_model_paths,
+    validate_model_paths as validate_sam2_model_paths,
 )
+
 
 Image.MAX_IMAGE_PIXELS = None
 
 os.environ['YOLO_AUTOINSTALL'] = '0'
 os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'
+
+def normalize_aspect_ratios(aspect_ratios):
+    """Accept '1024x1024,768x1024' OR ['1024x1024'] OR [(1024,1024)] and return list[str] like ['1024x1024']"""
+    if aspect_ratios is None:
+        return []
+    if isinstance(aspect_ratios, str):
+        return [ar.strip() for ar in aspect_ratios.split(',') if ar.strip()]
+    if isinstance(aspect_ratios, (list, tuple)):
+        out = []
+        for ar in aspect_ratios:
+            if isinstance(ar, str):
+                s = ar.strip()
+                if s:
+                    out.append(s)
+            elif isinstance(ar, (list, tuple)) and len(ar) == 2:
+                out.append(f"{int(ar[0])}x{int(ar[1])}")
+            else:
+                s = str(ar).strip()
+                if s:
+                    out.append(s)
+        return out
+    return [str(aspect_ratios).strip()]
+
+def parse_aspect_ratio_tuples(aspect_ratios):
+    ars = normalize_aspect_ratios(aspect_ratios)
+    tuples = []
+    for ar in ars:
+        w, h = ar.lower().split('x')
+        tuples.append((int(w), int(h)))
+    return tuples
+
 
 img_formats = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.tif', '.webp', '.heic', '.raw',
 '.cr2', '.nef', '.arw', '.svg', '.ico', '.psd', '.ai', '.eps', '.pdf', '.indd',
@@ -153,7 +189,7 @@ def filter_existing_files(image_files, output_folder, aspect_ratios, save_yolo, 
     skipped_files = []
     
     # Parse aspect ratios
-    aspect_ratio_list = [tuple(map(int, ar.strip().split('x'))) for ar in aspect_ratios.split(',')]
+    aspect_ratio_list = parse_aspect_ratio_tuples(aspect_ratios)
     
     for filename in image_files:
         base_name = os.path.splitext(filename)[0]
@@ -1512,21 +1548,25 @@ class UnionFind:
             if self.rank[root_x] == self.rank[root_y]:
                 self.rank[root_x] += 1
 
-def initialize_sam2_models(device):
+def initialize_sam2_models(model_dir, device):
+    """Initialize SAM2 + GroundingDINO using explicit model_dir passed from run_preprocess."""
     try:
-        sam2_model = build_sam2(SAM2_MODEL_CONFIG, SAM2_CHECKPOINT, device=device)
+        paths = resolve_sam2_model_paths(model_dir)
+        validate_sam2_model_paths(paths)
+
+        sam2_model = build_sam2(paths["SAM2_MODEL_CONFIG"], paths["SAM2_CHECKPOINT"], device=device)
         sam2_predictor = SAM2ImagePredictor(sam2_model)
         grounding_model = load_model(
-            model_config_path=GROUNDING_DINO_CONFIG,
-            model_checkpoint_path=GROUNDING_DINO_CHECKPOINT,
+            model_config_path=paths["GROUNDING_DINO_CONFIG"],
+            model_checkpoint_path=paths["GROUNDING_DINO_CHECKPOINT"],
             device=device
         )
         return {
-            'sam2_predictor': sam2_predictor,
-            'grounding_model': grounding_model
+            "sam2_predictor": sam2_predictor,
+            "grounding_model": grounding_model,
         }
     except Exception as e:
-        raise Exception(f"Failed to initialize SAM2 models: {str(e)}")
+        raise Exception(f"Failed to initialize SAM2 models (model_dir={model_dir}): {str(e)}")
 
 def initialize_yolo_models(model_dir, device, selected_class="yolov11l-face.pt"):
     try:
@@ -1548,7 +1588,7 @@ def process_single_image(image_path, input_folder, output_folder, yolo_folder,
                         padding_value, padding_unit):
     try:
         filename = os.path.basename(image_path)
-        aspect_ratios = [tuple(map(int, ar.strip().split('x'))) for ar in aspect_ratios.split(',')]
+        aspect_ratios = parse_aspect_ratio_tuples(aspect_ratios)
         
         if sam2_prompt:
             sam2_predictor = models['sam2_predictor']
@@ -1619,7 +1659,7 @@ def worker_process(gpu_id, worker_id, tasks, input_folder, output_folder, yolo_f
 
         try:
             if sam2_prompt:
-                models = initialize_sam2_models(device)
+                models = initialize_sam2_models(model_dir, device)
             else:
                 models = initialize_yolo_models(model_dir, device, selected_class)
         except Exception as e:
@@ -1737,7 +1777,7 @@ def cancel_duplicates_handler():
 #                                  save_as_png, sam2_prompt, models, device, debug_mode, skip_no_detection=False):
 #     try:
 #         filename = os.path.basename(image_path)
-#         aspect_ratios = [tuple(map(int, ar.strip().split('x'))) for ar in aspect_ratios.split(',')]
+#         aspect_ratios = parse_aspect_ratio_tuples(aspect_ratios)
         
 #         if sam2_prompt:
 #             sam2_predictor = models['sam2_predictor']
@@ -1893,7 +1933,7 @@ def process_image_face_enhanced(args):
         if sam2_prompt:
             if debug:
                 logging.critical("Initializing SAM2 models in worker process...")
-            models = initialize_sam2_models(device)
+            models = initialize_sam2_models(model_dir, device)
             sam2_predictor = models.get('sam2_predictor')
             grounding_model = models.get('grounding_model')
             yolo_model = None
