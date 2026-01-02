@@ -1732,34 +1732,34 @@ def cancel_duplicates_handler():
     time.sleep(1)
     return "⚠️ Duplicate detection cancelled."
 
-def process_single_image_process(image_path, input_folder, output_folder, yolo_folder, 
-                                 aspect_ratios, save_yolo, overwrite, selected_class,
-                                 save_as_png, sam2_prompt, models, device, debug_mode, skip_no_detection=False):
-    try:
-        filename = os.path.basename(image_path)
-        aspect_ratios = [tuple(map(int, ar.strip().split('x'))) for ar in aspect_ratios.split(',')]
+# def process_single_image_process(image_path, input_folder, output_folder, yolo_folder, 
+#                                  aspect_ratios, save_yolo, overwrite, selected_class,
+#                                  save_as_png, sam2_prompt, models, device, debug_mode, skip_no_detection=False):
+#     try:
+#         filename = os.path.basename(image_path)
+#         aspect_ratios = [tuple(map(int, ar.strip().split('x'))) for ar in aspect_ratios.split(',')]
         
-        if sam2_prompt:
-            sam2_predictor = models['sam2_predictor']
-            grounding_model = models['grounding_model']
-            result = process_image((
-                filename, input_folder, output_folder, aspect_ratios,
-                yolo_folder, save_yolo, overwrite, selected_class,
-                save_as_png, sam2_prompt, None, sam2_predictor, grounding_model, debug_mode, skip_no_detection,
-                padding_value, padding_unit
-            ))
-        else:
-            yolo_model = models['yolo_model']
-            result = process_image((
-                filename, input_folder, output_folder, aspect_ratios,
-                yolo_folder, save_yolo, overwrite, selected_class,
-                save_as_png, None, yolo_model, None, None, debug_mode, skip_no_detection,
-                padding_value, padding_unit
-            ))
+#         if sam2_prompt:
+#             sam2_predictor = models['sam2_predictor']
+#             grounding_model = models['grounding_model']
+#             result = process_image((
+#                 filename, input_folder, output_folder, aspect_ratios,
+#                 yolo_folder, save_yolo, overwrite, selected_class,
+#                 save_as_png, sam2_prompt, None, sam2_predictor, grounding_model, debug_mode, skip_no_detection,
+#                 padding_value, padding_unit
+#             ))
+#         else:
+#             yolo_model = models['yolo_model']
+#             result = process_image((
+#                 filename, input_folder, output_folder, aspect_ratios,
+#                 yolo_folder, save_yolo, overwrite, selected_class,
+#                 save_as_png, None, yolo_model, None, None, debug_mode, skip_no_detection,
+#                 padding_value, padding_unit
+#             ))
         
-        return result
-    except Exception as e:
-        raise Exception(f"Error processing {image_path}: {str(e)}")
+#         return result
+#     except Exception as e:
+#         raise Exception(f"Error processing {image_path}: {str(e)}")
 
 def detect_face_or_object(img_array, selected_class, sam2_prompt, model, sam2_predictor, grounding_model, debug_mode=False):
     """
